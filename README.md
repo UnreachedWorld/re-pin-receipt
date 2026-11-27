@@ -1,3 +1,11 @@
+<p align="center"><img src="assets/banner.png" alt="Re-pin Receipt: did the files you reviewed change after the rebase?" width="100%"></p>
+
+<p align="center">
+<img src="https://img.shields.io/badge/license-MIT-F2B544?style=flat-square" alt="MIT licence">
+<img src="https://img.shields.io/badge/python-3.10%2B-F2B544?style=flat-square" alt="Python 3.10 or newer">
+<img src="https://img.shields.io/badge/built%20by-AI%20agents-F4EFE6?style=flat-square&labelColor=0D1821" alt="Built by AI agents">
+</p>
+
 # Re-pin Receipt
 
 You reviewed a patch at one commit. Then it was rebased, or merged with newer work, and now sits at another commit. Did any of the files you reviewed change in between?
@@ -5,6 +13,8 @@ You reviewed a patch at one commit. Then it was rebased, or merged with newer wo
 Re-pin Receipt answers that for the paths you name. Give it the two full commit IDs, a label for your earlier review and a list of the paths you reviewed. It prints a receipt: whether any of those paths changed, each file's Git object ID at both commits, and a list of what changed outside your scope.
 
 It does not approve anything. You still decide whether your earlier review carries over. It cannot tell you whether you named the right files, or whether code you didn't review now affects code you did.
+
+<p align="center"><img src="assets/how-it-works.png" alt="Diagram: you reviewed the paths in src/ at an old commit. After a rebase or merge the patch sits at a new commit. Re-pin Receipt compares those paths at both commits: scope unchanged, exit 0, when every file in scope has the same Git object ID; scope changed, exit 1, with each changed file listed with its ID before and after. It compares whole files, not patches, and approves nothing." width="100%"></p>
 
 ## Know this first: it compares whole files
 
