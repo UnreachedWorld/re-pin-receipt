@@ -268,11 +268,17 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(help_run.returncode, 0, help_run.stderr.decode())
         help_text = help_run.stdout.decode()
         readme = (CLI.parent / "README.md").read_text(encoding="utf-8")
-        for fact in ("--repo", "--json", "--version", "added", "deleted", "(absent)",
-                     "blank", "paths with a . or .. component", "start with #",
-                     "non-UTF-8 path refuses the run"):
-            with self.subTest(fact=fact):
+        shared = ("--repo", "--json", "--version", "added", "deleted", "(absent)", "blank")
+        help_only = ("paths with a . or .. component", "start with #",
+                     "non-UTF-8 path refuses the run")
+        readme_only = ("paths with an empty, `.` or `..` component",
+                       "lines that start with `#`",
+                       "One path anywhere in the two commits that is not valid UTF-8 refuses the whole run.")
+        for fact in shared + help_only:
+            with self.subTest(side="help", fact=fact):
                 self.assertIn(fact, help_text)
+        for fact in shared + readme_only:
+            with self.subTest(side="readme", fact=fact):
                 self.assertIn(fact, readme)
 
     def test_text_receipt_and_sha256_repository(self):
