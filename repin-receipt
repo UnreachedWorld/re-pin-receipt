@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Re-pin Receipt compares committed Git trees within a declared literal review scope."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+VERSION = "0.1.0"
+OID_LENGTH = {"sha1": 40, "sha256": 64}
+DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+class InvalidEvidence(ValueError):
+    """The supplied scope or committed trees cannot support a complete receipt."""
+
+
+def read_git(repo, args, reason):
+    """Read local Git objects with replacement refs, inherited Git selectors and transport disabled."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_TERMINAL_PROMPT="0",
+               GIT_OPTIONAL_LOCKS="0")
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "-c", "core.warnAmbiguousRefs=true", "-C", os.fspath(repo), *args],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, check=False,
+        )
+    except OSError:
+        raise InvalidEvidence("Git could not be started. Check that Git is installed on PATH.") from None
+    if re.search(rb"^warning: refname [^\n]+ is ambiguous\.?$", result.stderr, re.MULTILINE):
+        raise InvalidEvidence("Git reports an ambiguous endpoint OID.")
+    if result.returncode:
+        raise InvalidEvidence(reason)
+    return result.stdout
+
+
+def object_format(repo):
+    """Get the selected local repository's storage object format."""
+    raw = read_git(repo, ["rev-parse", "--show-object-format"],
+                   "Supply an existing local Git repository.").strip()
+    if raw not in (b"sha1", b"sha256"):
+        raise InvalidEvidence("The repository must report a supported Git object format.")
+    return raw.decode("ascii")
+
+
+def full_oid(value, width):
+    """Recognize a full hexadecimal OID of this repository's format."""
+    return len(value) == width and re.fullmatch(r"[0-9a-fA-F]+", value) is not None
+
+
+def commit_id(repo, value, width, option):
+    """Require an exact local commit without accepting a tag or peeling another object type."""
+    if not full_oid(value, width):
+        raise InvalidEvidence(f"{option} requires a full {width}-digit hexadecimal Git OID.")
+    oid = value.lower()
+    kind = read_git(repo, ["cat-file", "-t", oid], f"{option} does not identify an available local commit.")
+    if kind.strip() != b"commit":
+        raise InvalidEvidence(f"{option} must identify a commit object.")
+    return oid
+
+
+def parent_prefixes(path):
+    """Yield literal slash-terminated parent directories, closest first."""
+    parent = path.rpartition("/")[0]
+    while parent:
+        yield parent + "/"
+        parent = parent.rpartition("/")[0]
+
+
+def read_scope(path):
+    """Read a nonempty UTF-8 list of unambiguous literal files and directory prefixes."""
+    try:
+        content = path.read_bytes().decode("utf-8")
+    except OSError:
+        raise InvalidEvidence("The scope file could not be read.") from None
+    except UnicodeError:
+        raise InvalidEvidence("The scope file must be UTF-8.") from None
+    lines = content.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines or "" in lines:
+        raise InvalidEvidence("The scope file needs one nonempty path per line.")
+    seen = set()
+    for entry in lines:
+        if not entry.isprintable():
+            raise InvalidEvidence("Every scope path must be a printable single line.")
+        if entry.startswith("#"):
+            raise InvalidEvidence("A scope line must not start with #.")
+        literal = entry.removesuffix("/")
+        if (literal.startswith(("/", "\\")) or DRIVE_PREFIX.match(literal)
+                or any(part in ("", ".", "..") for part in literal.split("/"))):
+            raise InvalidEvidence("Scope paths must be literal repository-relative paths.")
+        if entry in seen:
+            raise InvalidEvidence("The scope file contains a duplicate path.")
+        seen.add(entry)
+    for entry in lines:
+        if any(parent in seen for parent in parent_prefixes(entry.removesuffix("/"))):
+            raise InvalidEvidence("Scope entries overlap. Declare a path only once.")
+    return sorted(lines)
+
+
+def read_tree(repo, oid, width, option):
+    """Decode terminal NUL-delimited entries, without reading their file contents."""
+    raw = read_git(repo, ["ls-tree", "-r", "-z", "--full-tree", oid],
+                   f"The committed tree for {option} is unavailable or incomplete.")
+    if raw and not raw.endswith(b"\0"):
+        raise InvalidEvidence("A committed tree has incomplete entry framing.")
+    entries = {}
+    for record in raw.split(b"\0")[:-1]:
+        header, separator, path = record.partition(b"\t")
+        try:
+            name = path.decode("utf-8")
+            mode, kind, object_id = header.decode("ascii").split()
+        except UnicodeError:
+            raise InvalidEvidence("A committed path or entry is not representable as UTF-8.") from None
+        except ValueError:
+            raise InvalidEvidence("A committed tree has malformed entry metadata.") from None
+        if (not separator or not name or name in entries or re.fullmatch(r"[0-7]{6}", mode) is None
+                or kind not in ("blob", "commit") or not full_oid(object_id, width)):
+            raise InvalidEvidence("A committed tree has malformed or ambiguous entry metadata.")
+        entries[name] = {"mode": mode, "type": kind, "oid": object_id}
+    return entries
+
+
+def entry_status(old, new):
+    """Distinguish additions, deletions and changed or unchanged committed entries."""
+    if old is None:
+        return "added"
+    if new is None:
+        return "deleted"
+    return "unchanged" if old == new else "changed"
+
+
+def needs_directory_slash(entry, paths):
+    """A bare directory name matches only after the scope file adds a trailing slash."""
+    prefix = entry + "/"
+    return not entry.endswith("/") and any(path.startswith(prefix) for path in paths)
+
+
+def compare_trees(old_tree, new_tree, scope):
+    """Partition exact endpoint changes into scoped records and outside paths."""
+    declared = set(scope)
+    matched, rows, outside = set(), [], []
+    for path in sorted(old_tree.keys() | new_tree.keys()):
+        old, new = old_tree.get(path), new_tree.get(path)
+        owner = path if path in declared else next(
+            (parent for parent in parent_prefixes(path) if parent in declared), None)
+        if owner is None:
+            if old != new:
+                outside.append(path)
+            continue
+        matched.add(owner)
+        rows.append({"path": path, "status": entry_status(old, new), "old": old, "new": new})
+    if matched != declared:
+        paths = old_tree.keys() | new_tree.keys()
+        if any(needs_directory_slash(entry, paths) for entry in declared - matched):
+            raise InvalidEvidence("Every scope entry must match a committed file or directory prefix. add a trailing / for a directory.")
+        raise InvalidEvidence("Every scope entry must match a committed file or directory prefix.")
+    return rows, outside
+
+
+def create_receipt(repo, old, new, prior, scope_file):
+    """Build one deterministic receipt from the two validated local endpoint trees."""
+    if not prior.strip() or not prior.isprintable():
+        raise InvalidEvidence("The prior receipt ID must be nonempty and printable.")
+    scope = read_scope(scope_file)
+    fmt = object_format(repo)
+    width = OID_LENGTH[fmt]
+    old = commit_id(repo, old, width, "--old")
+    new = commit_id(repo, new, width, "--new")
+    old_tree = read_tree(repo, old, width, "--old")
+    new_tree = old_tree if new == old else read_tree(repo, new, width, "--new")
+    rows, outside = compare_trees(old_tree, new_tree, scope)
+    return {"schema_version": 1, "object_format": fmt, "receipt_id": prior,
+            "old_commit": old, "new_commit": new, "scope": scope,
+            "scope_changed": any(row["status"] != "unchanged" for row in rows),
+            "scoped": rows, "outside_scope_changed_paths": outside}
+
+
+def describe_entry(entry):
+    """Format one committed entry identity for the plain-text receipt."""
+    if entry is None:
+        return "(absent)"
+    return f"{entry['mode']} {entry['type']} {entry['oid']}"
+
+
+def render_text(receipt):
+    """Show the declared scope, entry identities and separate outside-path summary."""
+    status = "scope changed" if receipt["scope_changed"] else "scope unchanged"
+    lines = ["Re-pin Receipt", f"Prior receipt  {receipt['receipt_id']}",
+             f"Old commit     {receipt['old_commit']}", f"New commit     {receipt['new_commit']}",
+             f"Object format  {receipt['object_format']}", f"Result         {status}",
+             "", "Declared scope"]
+    lines.extend("  " + json.dumps(path, ensure_ascii=False) for path in receipt["scope"])
+    lines.extend(("", "In-scope entries"))
+    for row in receipt["scoped"]:
+        lines.append("  " + row["status"] + "  " + json.dumps(row["path"], ensure_ascii=False))
+        lines.append("    old  " + describe_entry(row["old"]))
+        lines.append("    new  " + describe_entry(row["new"]))
+    outside = receipt["outside_scope_changed_paths"]
+    lines.extend(("", f"Outside-scope changed paths  {len(outside)}"))
+    lines.extend("  " + json.dumps(path, ensure_ascii=False) for path in outside)
+    return "\n".join(lines)
+
+
+def main():
+    """Read one local comparison and print its text or JSON receipt."""
+    facts = (
+        "A scoped path is added, deleted, changed or unchanged. "
+        "A side missing from that commit is shown as (absent).\n"
+        "blank lines, paths with a . or .. component, and lines that start with # are refused.\n"
+        "One non-UTF-8 path refuses the run."
+    )
+    parser = argparse.ArgumentParser(
+        description=__doc__, epilog=facts, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repo", type=Path, default=Path("."), help="local repository (default: current directory)")
+    parser.add_argument("--old", required=True, help="full previously reviewed commit OID")
+    parser.add_argument("--new", required=True, help="full candidate commit OID")
+    parser.add_argument("--receipt", required=True, help="identifier of the previous review")
+    parser.add_argument("--scope", required=True, type=Path, help="UTF-8 file of literal reviewed paths")
+    parser.add_argument("--json", action="store_true", help="emit deterministic JSON v1")
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args()
+    try:
+        receipt = create_receipt(args.repo, args.old, args.new, args.receipt, args.scope)
+    except InvalidEvidence as error:
+        print(error, file=sys.stderr)
+        return 2
+    output = (json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+              if args.json else render_text(receipt))
+    sys.stdout.buffer.write((output + "\n").encode("utf-8"))
+    return int(receipt["scope_changed"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
