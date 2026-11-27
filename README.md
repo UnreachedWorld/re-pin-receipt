@@ -14,7 +14,7 @@ Re-pin Receipt answers that for the paths you name. Give it the two full commit 
 
 It does not approve anything. You still decide whether your earlier review carries over. It cannot tell you whether you named the right files, or whether code you didn't review now affects code you did.
 
-<p align="center"><img src="assets/how-it-works.png" alt="Diagram: you reviewed the paths in src/ at an old commit. After a rebase or merge the patch sits at a new commit. Re-pin Receipt compares those paths at both commits: scope unchanged, exit 0, when every file in scope has the same Git object ID; scope changed, exit 1, with each changed file listed with its ID before and after. It compares whole files, not patches, and approves nothing." width="100%"></p>
+<p align="center"><img src="assets/how-it-works.png" alt="Diagram: you reviewed the paths in src/ at an old commit. After a rebase or merge the patch sits at a new commit. Re-pin Receipt compares those paths at both commits: scope unchanged, exit 0, when the scoped entries match at both commits; scope changed, exit 1, when at least one scoped entry changed, and the receipt shows both sides, including absences. It compares whole files, not patches, and approves nothing." width="100%"></p>
 
 ## Know this first: it compares whole files
 
